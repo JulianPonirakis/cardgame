@@ -518,7 +518,7 @@ HOME_HTML = r"""
   </head>
 
   <body>
-    <h1>Cardgame</h1>
+    <h1>La Surprise</h1>
     <p class="sub">Create a room, share the code, then everyone locks a card. Reveal happens together. Highest wins a point. Tie = explosion (no point).</p>
 
     <!-- LOBBY -->
