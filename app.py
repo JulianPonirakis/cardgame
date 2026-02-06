@@ -2,6 +2,7 @@ import asyncio
 import json
 import random
 import string
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -65,6 +66,9 @@ class Player:
     hand: List[dict] = field(default_factory=list)
     locked: bool = False
 
+    # streak: consecutive wins
+    win_streak: int = 0
+
 
 @dataclass
 class Room:
@@ -82,6 +86,7 @@ class Room:
     pending_plays: Dict[str, dict] = field(default_factory=dict)
     last_reveal: Optional[dict] = None
 
+    # history: only update AFTER reveal completes (no spoilers)
     history: List[dict] = field(default_factory=list)
 
     sockets: Set[WebSocket] = field(default_factory=set)
@@ -89,6 +94,14 @@ class Room:
 
     starting: bool = False
     advancing: bool = False
+
+    # --- New rule state ---
+    aftershock_next: bool = False  # after explosion, next round worth 2
+    timer_task: Optional[asyncio.Task] = None
+    lock_deadline_ts: Optional[float] = None
+
+    # pending scoring (to avoid spoiler scoreboard)
+    pending_award: Optional[dict] = None  # {"winnerId":..., "points":..., "explosion":..., "reason":...}
 
 
 rooms: Dict[str, Room] = {}
@@ -120,6 +133,10 @@ def ensure_bot_fill(room: Room) -> None:
         room.players.append(Player(id=make_player_id(), name=f"Bot {bot_num}", is_bot=True))
 
 
+def clear_bots(room: Room) -> None:
+    room.players = [p for p in room.players if not p.is_bot]
+
+
 def deal_equally(room: Room) -> None:
     deck = new_deck()
     n = len(room.players)
@@ -143,6 +160,11 @@ def all_locked(room: Room) -> bool:
     return bool(room.players) and all(p.locked for p in room.players)
 
 
+def is_joker_round(room: Room) -> bool:
+    # Every 5th round (5, 10, 15...)
+    return room.round > 0 and room.round % 5 == 0
+
+
 def room_public_players(room: Room) -> List[dict]:
     return [
         {
@@ -152,9 +174,22 @@ def room_public_players(room: Room) -> List[dict]:
             "score": p.score,
             "locked": p.locked,
             "cardsLeft": len(p.hand),
+            "winStreak": p.win_streak,
         }
         for p in room.players
     ]
+
+
+def round_point_value(room: Room, winner: Player) -> int:
+    # Base +1
+    # Aftershock: +2 next round after explosion
+    # Win streak: once you have 2 consecutive wins, NEXT wins are worth +2 (so 3rd+ consecutive)
+    # Cap bonus at 2 total.
+    if room.aftershock_next:
+        return 2
+    if winner.win_streak >= 2:
+        return 2
+    return 1
 
 
 async def broadcast_state(room: Room) -> None:
@@ -184,7 +219,13 @@ async def broadcast_state(room: Room) -> None:
                     "isBot": you.is_bot if you else None,
                     "locked": you.locked if you else None,
                     "hand": you.hand if you else [],
+                    "winStreak": you.win_streak if you else 0,
                 },
+                # rules + timer visibility
+                "jokerRound": is_joker_round(room),
+                "aftershockNext": room.aftershock_next,
+                "lockDeadlineTs": room.lock_deadline_ts,
+                "pendingAward": room.pending_award,  # lets UI show “(+2)” without changing scoreboard early
             }
             await ws.send_text(json.dumps(payload))
         except Exception:
@@ -195,8 +236,15 @@ async def broadcast_state(room: Room) -> None:
         room.socket_to_player.pop(ws, None)
 
 
+def cancel_timer(room: Room) -> None:
+    if room.timer_task and not room.timer_task.done():
+        room.timer_task.cancel()
+    room.timer_task = None
+    room.lock_deadline_ts = None
+
+
 # ============================================================
-# Stronger bot behavior
+# Stronger bot behavior (keeps your spirit, but handles new rules)
 # ============================================================
 
 def bot_pick_index(n: int, pressure: float) -> int:
@@ -209,6 +257,7 @@ def bot_pick_index(n: int, pressure: float) -> int:
 
 
 def estimate_tie_risk(rank: int, n_players: int) -> float:
+    # medium ranks are more common tie-ish; extremes slightly safer
     mid = 8
     dist = abs(rank - mid)
     base = 0.10 + 0.05 * max(0, n_players - 2)
@@ -222,6 +271,7 @@ async def bot_choose(room: Room, bot: Player) -> None:
     if bot.locked or not bot.hand:
         return
 
+    joker = is_joker_round(room)
     hand_sorted = sorted(bot.hand, key=lambda c: c["rank"])
     n = len(hand_sorted)
 
@@ -231,32 +281,45 @@ async def bot_choose(room: Room, bot: Player) -> None:
 
     rounds_left = len(bot.hand)
 
+    # Pressure scale
     if trailing_by >= 3:
-        pressure = 0.90
+        pressure = 0.92
     elif trailing_by == 2:
-        pressure = 0.80
+        pressure = 0.82
     elif trailing_by == 1:
-        pressure = 0.64
+        pressure = 0.66
     elif trailing_by == 0:
-        pressure = 0.44
+        pressure = 0.46
     else:
-        pressure = 0.28
+        pressure = 0.30
 
+    # Endgame ramps up
     if rounds_left <= 4:
-        pressure = min(0.95, pressure + 0.18)
+        pressure = min(0.96, pressure + 0.18)
     if rounds_left <= 2:
         pressure = min(0.98, pressure + 0.12)
 
-    idx = bot_pick_index(n, pressure)
-    chosen = hand_sorted[idx]
-
-    risk = estimate_tie_risk(rank_value(chosen), len(room.players))
-    if risk > 0.28 and n >= 3:
+    # If Joker round, invert behavior (low wins)
+    if joker:
+        # If trailing, go lower even harder. If leading, avoid absolute minimum sometimes.
         if trailing_by >= 1:
-            idx = min(n - 1, idx + 1)
+            pressure_low = 0.10
         else:
-            idx = max(0, idx - 1)
+            pressure_low = 0.22
+        idx = bot_pick_index(n, pressure_low)
         chosen = hand_sorted[idx]
+    else:
+        idx = bot_pick_index(n, pressure)
+        chosen = hand_sorted[idx]
+
+        # Avoid tie-ish ranks if possible
+        risk = estimate_tie_risk(rank_value(chosen), len(room.players))
+        if risk > 0.28 and n >= 3:
+            if trailing_by >= 1:
+                idx = min(n - 1, idx + 1)
+            else:
+                idx = max(0, idx - 1)
+            chosen = hand_sorted[idx]
 
     for i, c in enumerate(bot.hand):
         if c["id"] == chosen["id"]:
@@ -285,32 +348,106 @@ async def schedule_bots(room: Room) -> None:
 
 
 # ============================================================
+# Table talk timer
+# ============================================================
+
+async def timer_countdown(room: Room, seconds: int = 10) -> None:
+    # Starts after first lock. If deadline hits, auto-lock remaining with random cards.
+    room.lock_deadline_ts = time.time() + float(seconds)
+    await broadcast_state(room)
+
+    try:
+        while True:
+            await asyncio.sleep(0.2)
+            if room.phase != "lock_in":
+                return
+            if all_locked(room):
+                return
+            if room.lock_deadline_ts is None:
+                return
+            if time.time() >= room.lock_deadline_ts:
+                break
+
+        # Auto-lock remaining
+        for p in room.players:
+            if not p.locked and p.hand:
+                chosen = random.choice(p.hand)
+                p.hand.remove(chosen)
+                room.pending_plays[p.id] = chosen
+                p.locked = True
+
+        await broadcast_state(room)
+        await maybe_start_reveal(room)
+    finally:
+        # timer ends either way
+        room.lock_deadline_ts = None
+        room.timer_task = None
+
+
+def ensure_timer_started(room: Room) -> None:
+    if room.timer_task is not None:
+        return
+    # Start only in lock_in once first lock happens
+    if room.phase != "lock_in":
+        return
+    room.timer_task = asyncio.create_task(timer_countdown(room, seconds=10))
+
+
+# ============================================================
 # Game flow
 # ============================================================
+
+async def reset_to_lobby(room: Room) -> None:
+    # Keep humans + host; clear bots; go lobby
+    cancel_timer(room)
+    room.phase = "lobby"
+    room.round = 0
+    room.rounds_played = 0
+    room.pending_plays = {}
+    room.last_reveal = None
+    room.pending_award = None
+    room.history = []
+    room.aftershock_next = False
+
+    for p in room.players:
+        p.score = 0
+        p.win_streak = 0
+        p.locked = False
+        p.hand = []
+
+    await broadcast_state(room)
+
 
 async def start_game(room: Room) -> None:
     if room.phase != "lobby":
         return
     if room.starting:
         return
+    # allow solo start
     if len(human_players(room)) < 1:
         return
 
     room.starting = True
     await broadcast_state(room)
-    await asyncio.sleep(0.15)
+    await asyncio.sleep(0.12)
 
+    # Fill bots now (not while joining)
     ensure_bot_fill(room)
 
+    # reset
+    cancel_timer(room)
     room.round = 1
     room.rounds_played = 0
     room.phase = "lock_in"
     room.pending_plays = {}
     room.last_reveal = None
+    room.pending_award = None
     room.history = []
+    room.aftershock_next = False
 
     for p in room.players:
         p.score = 0
+        p.win_streak = 0
         p.locked = False
         p.hand = []
 
@@ -319,6 +456,23 @@ async def start_game(room: Room) -> None:
 
     room.starting = False
     await broadcast_state(room)
+
+
+async def restart_same_lobby(room: Room) -> None:
+    # Same humans, same sockets, same code.
+    # Clear bots, then refill on start into lock_in.
+    cancel_timer(room)
+
+    # Keep humans as-is
+    humans = human_players(room)
+    room.players = humans
+
+    # host remains if still present, else first human
+    if room.host_id is None or find_player(room, room.host_id) is None:
+        room.host_id = humans[0].id if humans else None
+
+    # Now start a new game immediately (fills bots)
+    await start_game(room)
 
 
 async def maybe_start_reveal(room: Room) -> None:
@@ -330,11 +484,16 @@ async def maybe_start_reveal(room: Room) -> None:
         return
 
     room.advancing = True
-    await do_reveal_and_advance(room)
-    room.advancing = False
+    try:
+        await do_reveal_and_advance(room)
+    finally:
+        room.advancing = False
 
 
 async def do_reveal_and_advance(room: Room) -> None:
+    # Stop timer immediately once reveal begins
+    cancel_timer(room)
+
     room.phase = "reveal"
 
     order = [p.id for p in room.players]
@@ -347,19 +506,30 @@ async def do_reveal_and_advance(room: Room) -> None:
             card = {"id": "X", "suit": "S", "rank": 2, "label": "?", "symbol": "?", "color": "black"}
         plays.append({"playerId": pid, "card": card})
 
+    joker = is_joker_round(room)
+
     values = [(x["playerId"], rank_value(x["card"])) for x in plays]
-    max_val = max(v for _, v in values) if values else 0
-    top_ids = [pid for pid, v in values if v == max_val]
+    if values:
+        if joker:
+            best_val = min(v for _, v in values)
+        else:
+            best_val = max(v for _, v in values)
+    else:
+        best_val = 0
+
+    top_ids = [pid for pid, v in values if v == best_val]
 
     explosion = len(top_ids) > 1
     winner_id = None
     winner_card = None
+    points = 0
 
+    # Compute outcome now, but DO NOT update score until reveal pacing finishes
     if not explosion and top_ids:
         winner_id = top_ids[0]
         w = find_player(room, winner_id)
         if w:
-            w.score += 1
+            points = round_point_value(room, w)
         for x in plays:
             if x["playerId"] == winner_id:
                 winner_card = x["card"]
@@ -367,40 +537,78 @@ async def do_reveal_and_advance(room: Room) -> None:
 
     room.last_reveal = {
         "round": room.round,
+        "joker": joker,
+        "aftershockNext": room.aftershock_next,
         "order": order,
         "plays": plays,
         "winnerId": winner_id,
         "explosion": explosion,
         "topIds": top_ids,
-        "topRank": max_val,
+        "topRank": best_val,
         "winnerCard": winner_card,
+        "points": points,  # shown in banner without spoiling scoreboard
     }
 
+    room.pending_award = {
+        "winnerId": winner_id,
+        "explosion": explosion,
+        "points": points,
+        "joker": joker,
+    }
+
+    await broadcast_state(room)
+
+    # Reveal pacing
+    base = 2.2
+    per_card = 0.75
+    extra_pause_after = 2.4
+    wait_s = base + per_card * max(1, len(room.players)) + extra_pause_after
+    await asyncio.sleep(wait_s)
+
+    # Apply scoring AFTER reveal completes
+    if explosion:
+        # Explosion breaks streaks
+        for p in room.players:
+            p.win_streak = 0
+        # Aftershock: next round worth 2
+        room.aftershock_next = True
+    else:
+        if winner_id:
+            w = find_player(room, winner_id)
+            if w:
+                w.score += points
+                w.win_streak += 1
+                # Everyone else streak resets
+                for p in room.players:
+                    if p.id != winner_id:
+                        p.win_streak = 0
+        # Aftershock consumed (if it was active)
+        room.aftershock_next = False
+
+    # Only now append history (no spoilers pre-reveal)
     room.history.insert(
         0,
         {
             "round": room.round,
             "winnerId": winner_id,
             "explosion": explosion,
-            "topRank": max_val,
+            "topRank": best_val,
             "winnerCard": winner_card,
+            "points": points,
+            "joker": joker,
         },
     )
     room.history = room.history[:10]
 
-    await broadcast_state(room)
-
-    base = 1.8
-    per_card = 0.65
-    extra_pause_after = 1.9
-    await asyncio.sleep(base + per_card * max(1, len(room.players)) + extra_pause_after)
-
     room.rounds_played += 1
+
+    # Reset lock states
     for p in room.players:
         p.locked = False
 
     room.pending_plays = {}
     room.last_reveal = None
+    room.pending_award = None
 
     still_has_cards = any(len(p.hand) > 0 for p in room.players)
     if not still_has_cards:
@@ -423,7 +631,7 @@ HOME_HTML = r"""
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>La Surprise</title>
+    <title>Sorprese</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       :root{
@@ -461,7 +669,7 @@ HOME_HTML = r"""
         font-size: 54px; margin:0 0 8px;
         font-weight: 900; letter-spacing:0.6px;
       }
-      .sub{ margin:0 0 18px; color:var(--muted); max-width: 920px; }
+      .sub{ margin:0 0 18px; color:var(--muted); max-width: 980px; line-height:1.35; }
 
       .grid{ display:grid; grid-template-columns:1fr; gap:16px; }
       @media (min-width: 900px){ .grid{ grid-template-columns: 1fr 1fr; } }
@@ -595,7 +803,7 @@ HOME_HTML = r"""
       .playName{ font-size:12px; color: rgba(255,255,255,0.70); max-width: 120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
       /* ============================================================
-         CARDS: prettier + brighter selection ring (as requested)
+         CARDS: prettier + brighter selection ring
          ============================================================ */
       .card{
         width: 82px;
@@ -715,7 +923,7 @@ HOME_HTML = r"""
         gap: 16px;
       }
       @media (min-width: 900px){
-        .below{ grid-template-columns: 1fr 380px; }
+        .below{ grid-template-columns: 1fr 420px; }
       }
 
       .panel{
@@ -763,6 +971,11 @@ HOME_HTML = r"""
 
       .primary{ border-color: rgba(218,182,122,0.70); }
       .primary:hover{ border-color: rgba(218,182,122,1.0); }
+
+      /* Timer pill */
+      .timerPill{
+        border-color: rgba(218,182,122,0.35);
+      }
 
       #gameOver{
         position:fixed; inset:0;
@@ -813,8 +1026,13 @@ HOME_HTML = r"""
 
   <body>
     <div class="wrap">
-      <h1>La Surprise</h1>
-      <p class="sub">A game of nerve and timing. Join the lobby. The host starts when ready. Highest card wins a point. Tie = explosion.</p>
+      <h1>Sorprese</h1>
+      <p class="sub">
+        A game of nerve and timing. Highest card usually wins.
+        <b>Every 5th round is Joker</b> (lowest wins).
+        Tie at the top (or bottom on Joker) = <b>Explosion</b> — no points, and the next round is worth 2.
+        Win two rounds in a row and your next wins become worth 2.
+      </p>
 
       <div id="lobby">
         <div class="grid">
@@ -875,11 +1093,12 @@ HOME_HTML = r"""
           </div>
 
           <div class="row" style="margin-top:14px;">
-            <button onclick="newGameSameSize()">New game</button>
+            <button id="playAgainBtn" class="primary" onclick="playAgainSameLobby()" disabled>Play again (same lobby)</button>
+            <button onclick="newGameSameSize()">New room</button>
             <button onclick="backToLobby()">Back to lobby</button>
           </div>
 
-          <div class="status" style="margin-top:10px;">Send the room link to friends, then start when ready.</div>
+          <div class="status" style="margin-top:10px;">Tip: stay in the room and hit Play again to run it back.</div>
         </div>
       </div>
 
@@ -889,7 +1108,10 @@ HOME_HTML = r"""
           <div class="pill">Round: <span id="round">-</span></div>
           <div class="pill">Rounds played: <span id="roundsPlayed">0</span></div>
           <div class="pill">Phase: <span id="phase">-</span></div>
+          <div class="pill timerPill hide" id="timerPill">Timer: <span id="timerText">10.0</span>s</div>
+
           <button onclick="copyRoom()">Copy room code</button>
+          <button id="musicBtn" onclick="toggleMusic()">Music: Off</button>
         </div>
 
         <div class="tableShell">
@@ -931,7 +1153,7 @@ HOME_HTML = r"""
       let lastState = null;
       let selectedCardId = null;
 
-      // OPTION A: hide history until reveal animation ends
+      // Hide history until client reveal completes
       let revealDone = true;
 
       function byId(x){ return document.getElementById(x); }
@@ -1015,6 +1237,91 @@ HOME_HTML = r"""
         osc.stop(t0 + 0.22);
       }
 
+      // -------------------
+      // Ambient music (no files)
+      // -------------------
+      let musicOn = false;
+      let musicNodes = null;
+
+      function startMusic(){
+        ensureAudio();
+        if (musicNodes) return;
+
+        // gentle pad: two detuned sines + slow filter movement
+        const osc1 = audioCtx.createOscillator();
+        const osc2 = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        const filt = audioCtx.createBiquadFilter();
+
+        osc1.type = "sine";
+        osc2.type = "sine";
+        osc1.frequency.value = 110; // A2
+        osc2.frequency.value = 110.7;
+
+        filt.type = "lowpass";
+        filt.frequency.value = 520;
+
+        gain.gain.value = 0.0;
+
+        osc1.connect(filt);
+        osc2.connect(filt);
+        filt.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        osc1.start();
+        osc2.start();
+
+        // fade in
+        const t0 = audioCtx.currentTime;
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.018, t0 + 1.2);
+
+        // slow filter drift
+        const lfo = audioCtx.createOscillator();
+        const lfoGain = audioCtx.createGain();
+        lfo.type = "sine";
+        lfo.frequency.value = 0.06;
+        lfoGain.gain.value = 220;
+        lfo.connect(lfoGain);
+        lfoGain.connect(filt.frequency);
+        lfo.start();
+
+        musicNodes = {osc1, osc2, gain, filt, lfo, lfoGain};
+      }
+
+      function stopMusic(){
+        if (!musicNodes) return;
+        ensureAudio();
+        const {osc1, osc2, gain, lfo} = musicNodes;
+
+        const t0 = audioCtx.currentTime;
+        gain.gain.cancelScheduledValues(t0);
+        gain.gain.setValueAtTime(gain.gain.value, t0);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+
+        setTimeout(() => {
+          try{ osc1.stop(); }catch(e){}
+          try{ osc2.stop(); }catch(e){}
+          try{ lfo.stop(); }catch(e){}
+          musicNodes = null;
+        }, 650);
+      }
+
+      function toggleMusic(){
+        // user gesture required to start audio in most browsers
+        musicOn = !musicOn;
+        const btn = byId("musicBtn");
+        if (musicOn){
+          startMusic();
+          btn.textContent = "Music: On";
+          sfxChip();
+        } else {
+          stopMusic();
+          btn.textContent = "Music: Off";
+          sfxChip();
+        }
+      }
+
       // Dealer narration
       function setDealer(text){
         const el = byId("dealerLine");
@@ -1055,7 +1362,6 @@ HOME_HTML = r"""
         if (clickable) {
           el.style.cursor = "pointer";
           el.onclick = () => {
-            // Snappy click feel
             sfxFlip();
             selectedCardId = card.id;
             renderHand(lastState.you.hand || [], lastState.you.locked, lastState.phase);
@@ -1086,6 +1392,7 @@ HOME_HTML = r"""
         const code = byId("roomcode").textContent.trim();
         if (!code) return;
         navigator.clipboard.writeText(code);
+        sfxChip();
       }
 
       function renderLobby(players, hostId, youId, phase){
@@ -1095,7 +1402,7 @@ HOME_HTML = r"""
         panel.classList.remove("hide");
 
         const humans = players.filter(p => !p.isBot);
-        byId("lobbyHint").textContent = `Humans in lobby: ${humans.length}. Host starts when ready.`;
+        byId("lobbyHint").textContent = `Humans in lobby: ${humans.length}. Host starts when ready (solo allowed).`;
 
         const lp = byId("lobbyPlayers");
         lp.innerHTML = "";
@@ -1127,7 +1434,10 @@ HOME_HTML = r"""
           else if (phase === "reveal") status = "Revealing…";
           else status = p.locked ? "Locked" : "Choosing…";
 
-          row.innerHTML = `<div>${icon} <b>${p.name}</b> <span style="color:rgba(255,255,255,0.55);">(${status})</span></div>
+          let streak = "";
+          if (p.winStreak >= 2) streak = " 🔥 streak";
+
+          row.innerHTML = `<div>${icon} <b>${p.name}</b> <span style="color:rgba(255,255,255,0.55);">(${status}${streak})</span></div>
                            <div class="historyRight"><b>${p.score}</b> pts</div>`;
           el.appendChild(row);
         }
@@ -1190,6 +1500,7 @@ HOME_HTML = r"""
           let left = `Round ${h.round}`;
           let right = "";
 
+          if (h.joker) left += " — 🃏 Joker";
           if (h.explosion) {
             left += ` — 💥 Explosion`;
             right = `Top: ${h.topRank}`;
@@ -1198,7 +1509,7 @@ HOME_HTML = r"""
             const wname = winner ? winner.name : "Winner";
             const wc = h.winnerCard;
             left += ` — 🏆 ${wname}`;
-            right = wc ? `Won with ${cardText(wc)}` : "";
+            right = wc ? `Won with ${cardText(wc)} (+${h.points})` : `(+${h.points})`;
           }
 
           row.innerHTML = `<div>${left}</div><div class="historyRight">${right}</div>`;
@@ -1206,7 +1517,22 @@ HOME_HTML = r"""
         }
       }
 
-      function renderTable(phase, lastReveal, playersById) {
+      function renderTimer(deadlineTs, phase){
+        const pill = byId("timerPill");
+        const txt = byId("timerText");
+
+        if (phase !== "lock_in" || !deadlineTs){
+          pill.classList.add("hide");
+          return;
+        }
+        pill.classList.remove("hide");
+
+        const now = Date.now() / 1000.0;
+        const left = Math.max(0, deadlineTs - now);
+        txt.textContent = left.toFixed(1);
+      }
+
+      function renderTable(phase, lastReveal, playersById, pendingAward) {
         const el = byId("tablePlays");
         const rt = byId("resultText");
         const hint = byId("tableHint");
@@ -1219,7 +1545,14 @@ HOME_HTML = r"""
         }
 
         if (phase === "lock_in") {
-          hint.textContent = "Cards are face down. Reveal happens when everyone locks in.";
+          // Rule hints
+          if (lastState && lastState.jokerRound) {
+            hint.textContent = "🃏 Joker Round: lowest card wins. Lock in fast.";
+          } else if (lastState && lastState.aftershockNext) {
+            hint.textContent = "⚡ Aftershock: this round is worth 2.";
+          } else {
+            hint.textContent = "Cards are face down. Reveal happens when everyone locks in.";
+          }
 
           const ids = Object.keys(playersById);
           for (const pid of ids) {
@@ -1279,20 +1612,20 @@ HOME_HTML = r"""
             el.appendChild(wrap);
           }
 
-          // Flip SFX each step (each step reveals one more card)
           sfxFlip();
 
           i++;
           if (i < order.length) {
             setTimeout(step, 900);
           } else {
-            // Winner banner + SFX + dealer text + flow upgrades
+            // Banner: use pendingAward points (score not updated yet, on purpose)
+            const pts = (pendingAward && pendingAward.points) ? pendingAward.points : (lastReveal.points || 1);
+
             if (explosion) {
               sfxBoom();
-              rt.innerHTML = `<div class="banner tie">💥 Explosion — tie for highest card. No point awarded.</div>`;
-              setDealer("Dealer: A tie at the top. Boom. No one eats tonight.");
+              rt.innerHTML = `<div class="banner tie">💥 Explosion — tie at the top. No point awarded. Next round worth 2.</div>`;
+              setDealer("Dealer: A tie at the top. Boom. Next hand is worth blood.");
 
-              // Shake the table slightly
               const t = byId("tableEl");
               if (t){
                 t.classList.remove("shake");
@@ -1306,10 +1639,10 @@ HOME_HTML = r"""
               const wname = winner ? winner.name : "Winner";
               const wc = lastReveal.winnerCard;
               const wct = wc ? ` with ${cardText(wc)}` : "";
-              rt.innerHTML = `<div class="banner win">🏆 ${wname} wins the round (+1)${wct}.</div>`;
-              setDealer(`Dealer: ${wname} takes it.`);
+              const jokerTag = lastReveal.joker ? " 🃏" : "";
+              rt.innerHTML = `<div class="banner win">🏆 ${wname}${jokerTag} wins (+${pts})${wct}.</div>`;
+              setDealer(`Dealer: ${wname} takes it. (+${pts})`);
 
-              // Winner glow on the winning card for 1.5s
               const winningWrap = el.querySelector(`[data-pid="${winnerId}"]`);
               if (winningWrap){
                 const cardNode = winningWrap.querySelector(".card");
@@ -1320,11 +1653,9 @@ HOME_HTML = r"""
               }
             }
 
-            // OPTION A: reveal done -> now show history (no spoilers before this)
+            // Now allow history render (client-side)
             revealDone = true;
-            if (lastState) {
-              renderHistory(lastState.history, playersById);
-            }
+            if (lastState) renderHistory(lastState.history, playersById);
           }
         }
 
@@ -1349,8 +1680,11 @@ HOME_HTML = r"""
         if (locked) hint.textContent = "Locked in. Waiting for reveal…";
         else hint.textContent = "Select a card, then click Lock in.";
 
+        // Sort high -> low for readability (A, K, Q...)
+        const sorted = [...hand].sort((a,b) => (b.rank||0) - (a.rank||0));
+
         const canSelect = (phase === "lock_in" && !locked);
-        for (const c of hand) {
+        for (const c of sorted) {
           const selected = (selectedCardId === c.id);
           const showStamp = (locked && selected);
           el.appendChild(cardEl(c, canSelect, selected, showStamp));
@@ -1380,6 +1714,12 @@ HOME_HTML = r"""
         ws.send(JSON.stringify({ type: "start" }));
       }
 
+      function playAgainSameLobby(){
+        if (!ws || !lastState) return;
+        sfxChip();
+        ws.send(JSON.stringify({ type: "restart" }));
+      }
+
       function clearConfetti(){
         const card = document.querySelector(".gameOverCard");
         if (!card) return;
@@ -1403,7 +1743,7 @@ HOME_HTML = r"""
         }
       }
 
-      function showGameOver(players){
+      function showGameOver(players, hostId, youId){
         const sorted = [...players].sort((a,b) => b.score - a.score);
         const topScore = sorted.length ? sorted[0].score : 0;
         const winners = sorted.filter(p => p.score === topScore);
@@ -1424,6 +1764,10 @@ HOME_HTML = r"""
           row.innerHTML = `<div>${i+1}. ${icon} ${p.name}</div><div class="finalRowRight">${p.score} pts</div>`;
           board.appendChild(row);
         }
+
+        const playAgainBtn = byId("playAgainBtn");
+        const iAmHost = (youId && hostId && youId === hostId);
+        playAgainBtn.disabled = !iAmHost;
 
         byId("gameOver").classList.remove("hide");
         launchConfetti();
@@ -1489,7 +1833,7 @@ HOME_HTML = r"""
           if (msg.type === "state") {
             lastState = msg;
 
-            // OPTION A: reveal phase starts -> hide history until the animation completes
+            // reveal phase -> hide history until animation completes
             if (msg.phase === "reveal") revealDone = false;
             else revealDone = true;
 
@@ -1507,9 +1851,13 @@ HOME_HTML = r"""
             byId("round").textContent = msg.round || "-";
             byId("roundsPlayed").textContent = msg.roundsPlayed || 0;
 
-            // Dealer baseline lines
+            // Dealer baseline lines with rule spice
             if (msg.phase === "lobby") setDealer("Dealer: Waiting on the table to fill.");
-            if (msg.phase === "lock_in") setDealer("Dealer: Choose carefully. Lock it in when you feel brave.");
+            if (msg.phase === "lock_in") {
+              if (msg.jokerRound) setDealer("Dealer: Joker hand. Lowest wins. Watch your pride.");
+              else if (msg.aftershockNext) setDealer("Dealer: Aftershock. This one’s worth 2.");
+              else setDealer("Dealer: Choose carefully. Lock it in when you feel brave.");
+            }
             if (msg.phase === "reveal") setDealer("Dealer: Cards on the felt. No blinking now.");
             if (msg.phase === "finished") setDealer("Dealer: That’s the last hand. Good game.");
 
@@ -1520,22 +1868,28 @@ HOME_HTML = r"""
             renderScoreboard(msg.players, msg.phase);
             renderLockStatus(msg.players, msg.phase);
 
+            // Timer
+            renderTimer(msg.lockDeadlineTs, msg.phase);
+
+            // If revealing, don't show history until revealDone true
             if (msg.phase !== "reveal" || revealDone) {
               renderHistory(msg.history, playersById);
             } else {
               byId("history").innerHTML = `<div class="status">Revealing…</div>`;
             }
 
+            // keep selected card valid
             if (msg.you && msg.you.hand) {
               const exists = msg.you.hand.some(c => c.id === selectedCardId);
               if (!exists) selectedCardId = null;
             }
 
-            renderTable(msg.phase, msg.lastReveal, playersById);
+            renderTable(msg.phase, msg.lastReveal, playersById, msg.pendingAward);
             renderHand((msg.you && msg.you.hand) ? msg.you.hand : [], (msg.you && msg.you.locked) ? true : false, msg.phase);
 
+            // Game over overlay
             if (msg.phase === "finished") {
-              showGameOver(msg.players);
+              showGameOver(msg.players, msg.hostId, msg.you.id);
             } else {
               closeGameOver();
             }
@@ -1546,6 +1900,12 @@ HOME_HTML = r"""
           byId("status").textContent = "Disconnected. Refresh and rejoin.";
         };
       }
+
+      // keep timer updating smoothly client-side
+      setInterval(() => {
+        if (!lastState) return;
+        renderTimer(lastState.lockDeadlineTs, lastState.phase);
+      }, 120);
 
       const params = new URLSearchParams(location.search);
       if (params.get("code")) {
@@ -1613,6 +1973,7 @@ async def ws_room(websocket: WebSocket, code: str):
                 if player_id is not None:
                     continue
 
+                # Only joinable in lobby
                 if room.phase != "lobby":
                     await websocket.send_text(json.dumps({"type": "error", "message": "Game already started."}))
                     continue
@@ -1621,6 +1982,7 @@ async def ws_room(websocket: WebSocket, code: str):
                 player = Player(id=player_id, name=name, is_bot=False)
                 room.players.append(player)
 
+                # First human becomes host
                 if room.host_id is None:
                     room.host_id = player_id
 
@@ -1635,6 +1997,7 @@ async def ws_room(websocket: WebSocket, code: str):
                 continue
 
             if mtype == "start":
+                # Only host can start
                 if room.phase != "lobby":
                     continue
                 if room.host_id != player_id:
@@ -1645,6 +2008,18 @@ async def ws_room(websocket: WebSocket, code: str):
                     continue
 
                 asyncio.create_task(start_game(room))
+                continue
+
+            if mtype == "restart":
+                # play again same lobby (only host, only when finished)
+                if room.phase != "finished":
+                    await websocket.send_text(json.dumps({"type": "error", "message": "Can only restart after the game ends."}))
+                    continue
+                if room.host_id != player_id:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "Only the host can restart."}))
+                    continue
+
+                asyncio.create_task(restart_same_lobby(room))
                 continue
 
             if mtype == "lock":
@@ -1667,6 +2042,10 @@ async def ws_room(websocket: WebSocket, code: str):
                 room.pending_plays[you.id] = chosen
                 you.locked = True
 
+                # Start timer on first lock
+                ensure_timer_started(room)
+
+                # speed up bots once a human locks
                 for b in bot_players(room):
                     if not b.locked:
                         asyncio.create_task(bot_lock_after_delay(room, b, delay_s=random.uniform(0.35, 1.05)))
@@ -1682,13 +2061,17 @@ async def ws_room(websocket: WebSocket, code: str):
         room.socket_to_player.pop(websocket, None)
 
         if player_id:
+            # remove player
             room.players = [p for p in room.players if p.id != player_id]
 
+            # host handoff to first remaining human
             if room.host_id == player_id:
                 humans = human_players(room)
                 room.host_id = humans[0].id if humans else None
 
+            # If nobody human remains, mark finished and cancel timer
             if len(human_players(room)) < 1:
+                cancel_timer(room)
                 room.phase = "finished"
 
         await broadcast_state(room)
