@@ -114,7 +114,6 @@ def bot_players(room: Room) -> List[Player]:
 
 
 def ensure_bot_fill(room: Room) -> None:
-    # Add bots only at game start (never while joining)
     target = max(2, min(6, int(room.target_size)))
     while len(room.players) < target:
         bot_num = len([b for b in room.players if b.is_bot]) + 1
@@ -201,7 +200,6 @@ async def broadcast_state(room: Room) -> None:
 # ============================================================
 
 def bot_pick_index(n: int, pressure: float) -> int:
-    # pressure in [0,1] where 1 is "play high"
     if n <= 1:
         return 0
     p = max(0.0, min(1.0, pressure))
@@ -211,7 +209,6 @@ def bot_pick_index(n: int, pressure: float) -> int:
 
 
 def estimate_tie_risk(rank: int, n_players: int) -> float:
-    # Crude tie risk model: more players => more tie risk; extremes slightly safer
     mid = 8
     dist = abs(rank - mid)
     base = 0.10 + 0.05 * max(0, n_players - 2)
@@ -234,7 +231,6 @@ async def bot_choose(room: Room, bot: Player) -> None:
 
     rounds_left = len(bot.hand)
 
-    # Baseline pressure from score situation
     if trailing_by >= 3:
         pressure = 0.90
     elif trailing_by == 2:
@@ -244,9 +240,8 @@ async def bot_choose(room: Room, bot: Player) -> None:
     elif trailing_by == 0:
         pressure = 0.44
     else:
-        pressure = 0.28  # leading => conserve
+        pressure = 0.28
 
-    # Late game ramp: spend more when fewer rounds remain
     if rounds_left <= 4:
         pressure = min(0.95, pressure + 0.18)
     if rounds_left <= 2:
@@ -255,7 +250,6 @@ async def bot_choose(room: Room, bot: Player) -> None:
     idx = bot_pick_index(n, pressure)
     chosen = hand_sorted[idx]
 
-    # Tie avoidance nudge
     risk = estimate_tie_risk(rank_value(chosen), len(room.players))
     if risk > 0.28 and n >= 3:
         if trailing_by >= 1:
@@ -264,7 +258,6 @@ async def bot_choose(room: Room, bot: Player) -> None:
             idx = max(0, idx - 1)
         chosen = hand_sorted[idx]
 
-    # Remove from actual hand
     for i, c in enumerate(bot.hand):
         if c["id"] == chosen["id"]:
             bot.hand.pop(i)
@@ -300,8 +293,6 @@ async def start_game(room: Room) -> None:
         return
     if room.starting:
         return
-
-    # KEY FIX: allow solo starts
     if len(human_players(room)) < 1:
         return
 
@@ -309,7 +300,6 @@ async def start_game(room: Room) -> None:
     await broadcast_state(room)
     await asyncio.sleep(0.15)
 
-    # Fill bots now (not during lobby join)
     ensure_bot_fill(room)
 
     room.round = 1
@@ -400,7 +390,6 @@ async def do_reveal_and_advance(room: Room) -> None:
 
     await broadcast_state(room)
 
-    # pacing: server waits while client flips cards
     base = 1.8
     per_card = 0.65
     extra_pause_after = 1.9
@@ -512,10 +501,8 @@ HOME_HTML = r"""
 
       .hide{ display:none !important; }
 
-      /* GAME TOP BAR */
       #gameTop{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top: 10px; }
 
-      /* TABLE */
       .tableShell{
         margin-top: 14px;
         border-radius: 26px;
@@ -536,6 +523,7 @@ HOME_HTML = r"""
           linear-gradient(180deg, var(--felt1), var(--felt2));
         border: 1px solid rgba(0,0,0,0.35);
         overflow:hidden;
+        box-shadow: inset 0 0 80px rgba(0,0,0,0.35);
       }
 
       .table::before{
@@ -571,7 +559,6 @@ HOME_HTML = r"""
         color: rgba(255,255,255,0.55);
       }
 
-      /* positions for up to 6 seats */
       .pos0{ left: 50%; top: 12px; transform: translateX(-50%); }
       .pos1{ right: 18px; top: 80px; }
       .pos2{ right: 18px; bottom: 80px; }
@@ -579,7 +566,6 @@ HOME_HTML = r"""
       .pos4{ left: 18px; bottom: 80px; }
       .pos5{ left: 18px; top: 80px; }
 
-      /* Center play area */
       .center{
         position:absolute;
         left:50%; top:50%;
@@ -596,7 +582,7 @@ HOME_HTML = r"""
         align-items:flex-end;
         gap:12px;
         flex-wrap:wrap;
-        min-height: 160px;
+        min-height: 170px;
       }
 
       .playStack{
@@ -608,37 +594,120 @@ HOME_HTML = r"""
 
       .playName{ font-size:12px; color: rgba(255,255,255,0.70); max-width: 120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
-      /* Cards */
+      /* ============================================================
+         CARDS: prettier + brighter selection ring (as requested)
+         ============================================================ */
       .card{
-        width: 74px;
-        height: 104px;
-        border-radius: 14px;
-        border: 1px solid rgba(0,0,0,0.32);
-        background: rgba(255,255,255,0.96);
-        box-shadow: 0 10px 24px rgba(0,0,0,0.28);
+        width: 82px;
+        height: 116px;
+        border-radius: 16px;
+        border: 1px solid rgba(0,0,0,0.22);
+        background:
+          radial-gradient(circle at 30% 20%, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0.78) 45%, rgba(255,255,255,0.88) 100%);
+        box-shadow:
+          0 18px 40px rgba(0,0,0,0.30),
+          0 2px 0 rgba(255,255,255,0.65) inset;
         display:flex;
         flex-direction:column;
         justify-content:space-between;
         padding:10px;
         user-select:none;
-        transition: transform 0.12s ease, outline 0.12s ease, box-shadow 0.12s ease;
+        transition: transform 0.12s ease, box-shadow 0.12s ease, outline 0.12s ease, filter 0.12s ease;
+        position: relative;
       }
-      .card:hover{ transform: translateY(-2px); }
-      .card.selected{ outline: 3px solid rgba(255,255,255,0.45); }
-      .corner{ font-weight: 900; font-size: 18px; }
-      .suit{ font-size: 24px; align-self:flex-end; }
+
+      .card:hover{
+        transform: translateY(-3px);
+        box-shadow:
+          0 22px 52px rgba(0,0,0,0.36),
+          0 2px 0 rgba(255,255,255,0.65) inset;
+      }
+
+      .card.selected{
+        outline: 4px solid rgba(255,255,255,0.92);
+        box-shadow:
+          0 0 0 6px rgba(218,182,122,0.55),
+          0 0 22px rgba(218,182,122,0.70),
+          0 24px 60px rgba(0,0,0,0.38),
+          0 2px 0 rgba(255,255,255,0.65) inset;
+        transform: translateY(-4px);
+        filter: brightness(1.04);
+      }
+
+      .card::after{
+        content:"";
+        position:absolute;
+        inset: 10px;
+        border-radius: 12px;
+        background:
+          radial-gradient(circle at 70% 30%, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0) 42%),
+          radial-gradient(circle at 30% 70%, rgba(0,0,0,0.04) 0%, rgba(0,0,0,0) 45%);
+        pointer-events:none;
+      }
+
+      .corner{ font-weight: 900; font-size: 20px; }
+      .suit{ font-size: 28px; align-self:flex-end; }
+
       .red{ color: #c1121f; }
       .black{ color: #0f0f14; }
 
       .card.back{
         background:
           radial-gradient(circle at 30% 30%, rgba(255,255,255,0.10) 0%, rgba(0,0,0,0) 45%),
+          repeating-linear-gradient(45deg, rgba(255,255,255,0.06) 0 8px, rgba(0,0,0,0.00) 8px 16px),
           linear-gradient(135deg, #101016 0%, #2a2a33 100%);
-        border-color: rgba(255,255,255,0.10);
-        box-shadow: 0 10px 24px rgba(0,0,0,0.62);
+        border-color: rgba(255,255,255,0.12);
+        box-shadow: 0 14px 34px rgba(0,0,0,0.65);
       }
 
-      /* Hand panel */
+      /* Flow upgrades */
+      .lockedStamp{
+        position:absolute;
+        right: 8px;
+        bottom: 8px;
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.6px;
+        padding: 6px 8px;
+        border-radius: 10px;
+        background: rgba(0,0,0,0.72);
+        border: 1px solid rgba(255,255,255,0.18);
+        color: rgba(255,255,255,0.92);
+        transform: rotate(-6deg);
+        text-transform: uppercase;
+        pointer-events:none;
+      }
+
+      .winnerGlow{
+        outline: 4px solid rgba(218,182,122,0.95) !important;
+        box-shadow:
+          0 0 0 6px rgba(218,182,122,0.45),
+          0 0 28px rgba(218,182,122,0.85),
+          0 26px 70px rgba(0,0,0,0.40),
+          0 2px 0 rgba(255,255,255,0.65) inset !important;
+        animation: winnerPulse 1.5s ease-out forwards;
+      }
+
+      @keyframes winnerPulse{
+        0%{ filter: brightness(1.02); }
+        40%{ filter: brightness(1.12); }
+        100%{ filter: brightness(1.02); }
+      }
+
+      .shake{
+        animation: shake 520ms ease-in-out;
+      }
+
+      @keyframes shake{
+        0%{ transform: translate(0,0); }
+        15%{ transform: translate(-6px, 2px); }
+        30%{ transform: translate(6px, -2px); }
+        45%{ transform: translate(-5px, -1px); }
+        60%{ transform: translate(5px, 2px); }
+        75%{ transform: translate(-3px, 0px); }
+        100%{ transform: translate(0,0); }
+      }
+
       .below{
         margin-top: 14px;
         display:grid;
@@ -673,7 +742,6 @@ HOME_HTML = r"""
       .banner.win{ color: var(--gold); }
       .banner.tie{ color: var(--danger); }
 
-      /* History */
       .history{
         margin-top: 10px;
         border-top: 1px dashed rgba(255,255,255,0.18);
@@ -693,11 +761,9 @@ HOME_HTML = r"""
       }
       .historyRight{ color: rgba(255,255,255,0.62); white-space:nowrap; }
 
-      /* Lobby host start button */
       .primary{ border-color: rgba(218,182,122,0.70); }
       .primary:hover{ border-color: rgba(218,182,122,1.0); }
 
-      /* Game Over overlay */
       #gameOver{
         position:fixed; inset:0;
         display:flex; align-items:center; justify-content:center;
@@ -730,7 +796,6 @@ HOME_HTML = r"""
       }
       .finalRowRight{ color: rgba(255,255,255,0.62); white-space:nowrap; }
 
-      /* Confetti */
       .confettiPiece{
         position:absolute;
         top:-10px;
@@ -751,7 +816,6 @@ HOME_HTML = r"""
       <h1>La Surprise</h1>
       <p class="sub">A game of nerve and timing. Join the lobby. The host starts when ready. Highest card wins a point. Tie = explosion.</p>
 
-      <!-- LOBBY -->
       <div id="lobby">
         <div class="grid">
           <div class="box">
@@ -795,7 +859,6 @@ HOME_HTML = r"""
         </div>
       </div>
 
-      <!-- GAME OVER -->
       <div id="gameOver" class="hide">
         <div class="gameOverCard">
           <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
@@ -820,7 +883,6 @@ HOME_HTML = r"""
         </div>
       </div>
 
-      <!-- GAME -->
       <div id="game" class="hide">
         <div id="gameTop">
           <div class="pill">Room: <span class="code" id="roomcode"></span></div>
@@ -831,13 +893,12 @@ HOME_HTML = r"""
         </div>
 
         <div class="tableShell">
-          <div class="table">
-            <!-- Seats -->
+          <div class="table" id="tableEl">
             <div id="seats"></div>
 
-            <!-- Center -->
             <div class="center">
               <div class="centerHint" id="tableHint">Waiting…</div>
+              <div class="centerHint" id="dealerLine" style="margin-top:-2px; opacity:0.9;"></div>
               <div class="plays" id="tablePlays"></div>
               <div id="resultText"></div>
             </div>
@@ -875,6 +936,92 @@ HOME_HTML = r"""
 
       function byId(x){ return document.getElementById(x); }
 
+      // -------------------
+      // SOUND (Web Audio)
+      // -------------------
+      let audioCtx = null;
+
+      function ensureAudio(){
+        if (!audioCtx){
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === "suspended") audioCtx.resume();
+      }
+
+      function tone(freq, duration=0.08, type="sine", gain=0.05){
+        ensureAudio();
+        const t0 = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        g.gain.setValueAtTime(gain, t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+        osc.connect(g);
+        g.connect(audioCtx.destination);
+        osc.start(t0);
+        osc.stop(t0 + duration);
+      }
+
+      function noise(duration=0.12, gain=0.06){
+        ensureAudio();
+        const t0 = audioCtx.currentTime;
+        const bufferSize = Math.floor(audioCtx.sampleRate * duration);
+        const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * 0.9;
+
+        const src = audioCtx.createBufferSource();
+        src.buffer = buffer;
+        const g = audioCtx.createGain();
+        g.gain.setValueAtTime(gain, t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+        src.connect(g);
+        g.connect(audioCtx.destination);
+        src.start(t0);
+        src.stop(t0 + duration);
+      }
+
+      function sfxChip(){
+        tone(680, 0.04, "square", 0.03);
+        tone(520, 0.06, "triangle", 0.025);
+      }
+
+      function sfxFlip(){
+        noise(0.05, 0.04);
+        tone(240, 0.05, "sine", 0.02);
+      }
+
+      function sfxWin(){
+        tone(523, 0.09, "triangle", 0.04);
+        tone(659, 0.10, "triangle", 0.035);
+        tone(784, 0.12, "triangle", 0.03);
+      }
+
+      function sfxBoom(){
+        noise(0.16, 0.08);
+        ensureAudio();
+        const t0 = audioCtx.currentTime;
+        const osc = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(180, t0);
+        osc.frequency.exponentialRampToValueAtTime(40, t0 + 0.18);
+        g.gain.setValueAtTime(0.06, t0);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.20);
+        osc.connect(g);
+        g.connect(audioCtx.destination);
+        osc.start(t0);
+        osc.stop(t0 + 0.22);
+      }
+
+      // Dealer narration
+      function setDealer(text){
+        const el = byId("dealerLine");
+        if (!el) return;
+        el.textContent = text || "";
+      }
+
       function phaseLabel(p){
         if (p === "lobby") return "Lobby";
         if (p === "lock_in") return "Lock in";
@@ -888,7 +1035,7 @@ HOME_HTML = r"""
         return `${card.label}${card.symbol}`;
       }
 
-      function cardEl(card, clickable, selected) {
+      function cardEl(card, clickable, selected, showLockedStamp=false) {
         const el = document.createElement("div");
         el.className = "card " + (card.color === "red" ? "red" : "black");
         if (selected) el.classList.add("selected");
@@ -898,9 +1045,18 @@ HOME_HTML = r"""
           <div class="suit">${card.symbol}</div>
         `;
 
+        if (showLockedStamp){
+          const stamp = document.createElement("div");
+          stamp.className = "lockedStamp";
+          stamp.textContent = "LOCKED";
+          el.appendChild(stamp);
+        }
+
         if (clickable) {
           el.style.cursor = "pointer";
           el.onclick = () => {
+            // Snappy click feel
+            sfxFlip();
             selectedCardId = card.id;
             renderHand(lastState.you.hand || [], lastState.you.locked, lastState.phase);
           };
@@ -953,8 +1109,6 @@ HOME_HTML = r"""
 
         const startBtn = byId("startBtn");
         const iAmHost = (youId === hostId);
-
-        // KEY FIX: allow solo start (>=1 human)
         startBtn.disabled = !(iAmHost && humans.length >= 1 && phase === "lobby");
       }
 
@@ -1004,7 +1158,6 @@ HOME_HTML = r"""
         const seats = byId("seats");
         seats.innerHTML = "";
 
-        // Show seats in a stable order: humans first, then bots, then by join order
         const list = [...players];
         const humans = list.filter(p => !p.isBot);
         const bots = list.filter(p => p.isBot);
@@ -1072,6 +1225,7 @@ HOME_HTML = r"""
           for (const pid of ids) {
             const wrap = document.createElement("div");
             wrap.className = "playStack";
+            wrap.dataset.pid = pid;
 
             const name = document.createElement("div");
             name.className = "playName";
@@ -1108,6 +1262,7 @@ HOME_HTML = r"""
 
             const wrap = document.createElement("div");
             wrap.className = "playStack";
+            wrap.dataset.pid = pid;
 
             const name = document.createElement("div");
             name.className = "playName";
@@ -1115,25 +1270,54 @@ HOME_HTML = r"""
 
             wrap.appendChild(name);
 
-            if (j <= i) wrap.appendChild(cardEl(playMap[pid], false, false));
-            else wrap.appendChild(cardBackEl());
+            if (j <= i) {
+              wrap.appendChild(cardEl(playMap[pid], false, false));
+            } else {
+              wrap.appendChild(cardBackEl());
+            }
 
             el.appendChild(wrap);
           }
+
+          // Flip SFX each step (each step reveals one more card)
+          sfxFlip();
 
           i++;
           if (i < order.length) {
             setTimeout(step, 900);
           } else {
-            // Winner banner
+            // Winner banner + SFX + dealer text + flow upgrades
             if (explosion) {
+              sfxBoom();
               rt.innerHTML = `<div class="banner tie">💥 Explosion — tie for highest card. No point awarded.</div>`;
+              setDealer("Dealer: A tie at the top. Boom. No one eats tonight.");
+
+              // Shake the table slightly
+              const t = byId("tableEl");
+              if (t){
+                t.classList.remove("shake");
+                void t.offsetWidth;
+                t.classList.add("shake");
+                setTimeout(() => { try{ t.classList.remove("shake"); }catch(e){} }, 650);
+              }
             } else {
+              sfxWin();
               const winner = playersById[winnerId];
               const wname = winner ? winner.name : "Winner";
               const wc = lastReveal.winnerCard;
               const wct = wc ? ` with ${cardText(wc)}` : "";
               rt.innerHTML = `<div class="banner win">🏆 ${wname} wins the round (+1)${wct}.</div>`;
+              setDealer(`Dealer: ${wname} takes it.`);
+
+              // Winner glow on the winning card for 1.5s
+              const winningWrap = el.querySelector(`[data-pid="${winnerId}"]`);
+              if (winningWrap){
+                const cardNode = winningWrap.querySelector(".card");
+                if (cardNode){
+                  cardNode.classList.add("winnerGlow");
+                  setTimeout(() => { try{ cardNode.classList.remove("winnerGlow"); }catch(e){} }, 1500);
+                }
+              }
             }
 
             // OPTION A: reveal done -> now show history (no spoilers before this)
@@ -1168,7 +1352,8 @@ HOME_HTML = r"""
         const canSelect = (phase === "lock_in" && !locked);
         for (const c of hand) {
           const selected = (selectedCardId === c.id);
-          el.appendChild(cardEl(c, canSelect, selected));
+          const showStamp = (locked && selected);
+          el.appendChild(cardEl(c, canSelect, selected, showStamp));
         }
 
         const btn = document.createElement("button");
@@ -1184,11 +1369,14 @@ HOME_HTML = r"""
         if (lastState.phase !== "lock_in") return;
         if (lastState.you.locked) return;
         if (!selectedCardId) return;
+
+        sfxChip();
         ws.send(JSON.stringify({ type: "lock", cardId: selectedCardId }));
       }
 
       function hostStart(){
         if (!ws) return;
+        sfxChip();
         ws.send(JSON.stringify({ type: "start" }));
       }
 
@@ -1267,6 +1455,7 @@ HOME_HTML = r"""
         lastState = null;
         selectedCardId = null;
         revealDone = true;
+        setDealer("");
       }
 
       function joinRoom() {
@@ -1318,6 +1507,12 @@ HOME_HTML = r"""
             byId("round").textContent = msg.round || "-";
             byId("roundsPlayed").textContent = msg.roundsPlayed || 0;
 
+            // Dealer baseline lines
+            if (msg.phase === "lobby") setDealer("Dealer: Waiting on the table to fill.");
+            if (msg.phase === "lock_in") setDealer("Dealer: Choose carefully. Lock it in when you feel brave.");
+            if (msg.phase === "reveal") setDealer("Dealer: Cards on the felt. No blinking now.");
+            if (msg.phase === "finished") setDealer("Dealer: That’s the last hand. Good game.");
+
             const playersById = {};
             for (const p of msg.players) playersById[p.id] = p;
 
@@ -1325,7 +1520,6 @@ HOME_HTML = r"""
             renderScoreboard(msg.players, msg.phase);
             renderLockStatus(msg.players, msg.phase);
 
-            // history: only show if not revealing OR reveal animation done
             if (msg.phase !== "reveal" || revealDone) {
               renderHistory(msg.history, playersById);
             } else {
@@ -1419,7 +1613,6 @@ async def ws_room(websocket: WebSocket, code: str):
                 if player_id is not None:
                     continue
 
-                # Only joinable in lobby
                 if room.phase != "lobby":
                     await websocket.send_text(json.dumps({"type": "error", "message": "Game already started."}))
                     continue
@@ -1428,7 +1621,6 @@ async def ws_room(websocket: WebSocket, code: str):
                 player = Player(id=player_id, name=name, is_bot=False)
                 room.players.append(player)
 
-                # First human becomes host
                 if room.host_id is None:
                     room.host_id = player_id
 
@@ -1443,14 +1635,11 @@ async def ws_room(websocket: WebSocket, code: str):
                 continue
 
             if mtype == "start":
-                # Only host can start
                 if room.phase != "lobby":
                     continue
                 if room.host_id != player_id:
                     await websocket.send_text(json.dumps({"type": "error", "message": "Only the host can start."}))
                     continue
-
-                # KEY FIX: allow solo start (>=1 human)
                 if len(human_players(room)) < 1:
                     await websocket.send_text(json.dumps({"type": "error", "message": "Need at least 1 human player."}))
                     continue
@@ -1478,7 +1667,6 @@ async def ws_room(websocket: WebSocket, code: str):
                 room.pending_plays[you.id] = chosen
                 you.locked = True
 
-                # speed up bots slightly after a human locks
                 for b in bot_players(room):
                     if not b.locked:
                         asyncio.create_task(bot_lock_after_delay(room, b, delay_s=random.uniform(0.35, 1.05)))
@@ -1496,12 +1684,10 @@ async def ws_room(websocket: WebSocket, code: str):
         if player_id:
             room.players = [p for p in room.players if p.id != player_id]
 
-            # If host left, assign a new host among humans (if any)
             if room.host_id == player_id:
                 humans = human_players(room)
                 room.host_id = humans[0].id if humans else None
 
-            # If no humans left, freeze room
             if len(human_players(room)) < 1:
                 room.phase = "finished"
 
