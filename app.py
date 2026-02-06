@@ -94,7 +94,10 @@ class Room:
     pending_plays: Dict[str, dict] = field(default_factory=dict)  # playerId -> card
 
     # Reveal payload broadcast only when phase == reveal
-    last_reveal: Optional[dict] = None  # {"round":int,"order":[ids],"plays":[{playerId,card}], "winnerId":..., "explosion":bool}
+    last_reveal: Optional[dict] = None  # {"round":int,"order":[ids],"plays":[{playerId,card}], "winnerId":..., "explosion":bool, "topIds":[...], "topRank":int}
+
+    # Round history (last N entries)
+    history: List[dict] = field(default_factory=list)  # [{"round":6,"winnerId":...,"explosion":bool,"topRank":int,"winnerCard":{...}}]
 
     sockets: Set[WebSocket] = field(default_factory=set)
     socket_to_player: Dict[WebSocket, str] = field(default_factory=dict)
@@ -180,6 +183,7 @@ async def broadcast_state(room: Room) -> None:
                 "targetSize": room.target_size,
                 "players": room_public_players(room),
                 "lastReveal": visible_reveal,
+                "history": room.history,  # always visible
                 "you": {
                     "id": you.id if you else None,
                     "name": you.name if you else None,
@@ -270,6 +274,7 @@ async def start_game(room: Room) -> None:
     room.phase = "lock_in"
     room.pending_plays = {}
     room.last_reveal = None
+    room.history = []
 
     deal_equally(room)
     await schedule_bots(room)
@@ -303,22 +308,28 @@ async def do_reveal_and_advance(room: Room) -> None:
     for pid in order:
         card = room.pending_plays.get(pid)
         if card is None:
-            # Shouldn't happen if all_locked is true, but keep safe.
             card = {"id": "X", "suit": "S", "rank": 2, "label": "?", "symbol": "?", "color": "black"}
         plays.append({"playerId": pid, "card": card})
 
     # Determine winner (highest rank). Tie = explosion (no point).
     values = [(x["playerId"], rank_value(x["card"])) for x in plays]
     max_val = max(v for _, v in values) if values else 0
-    top = [pid for pid, v in values if v == max_val]
+    top_ids = [pid for pid, v in values if v == max_val]
 
-    explosion = len(top) > 1
+    explosion = len(top_ids) > 1
     winner_id = None
-    if not explosion and top:
-        winner_id = top[0]
+    winner_card = None
+
+    if not explosion and top_ids:
+        winner_id = top_ids[0]
         w = find_player(room, winner_id)
         if w:
             w.score += 1
+        # Find winner's card
+        for x in plays:
+            if x["playerId"] == winner_id:
+                winner_card = x["card"]
+                break
 
     room.last_reveal = {
         "round": room.round,
@@ -326,12 +337,24 @@ async def do_reveal_and_advance(room: Room) -> None:
         "plays": plays,
         "winnerId": winner_id,
         "explosion": explosion,
+        "topIds": top_ids,
+        "topRank": max_val,
     }
+
+    # Update history (keep last 8)
+    entry = {
+        "round": room.round,
+        "winnerId": winner_id,
+        "explosion": explosion,
+        "topRank": max_val,
+        "winnerCard": winner_card,  # may be None on explosion
+    }
+    room.history.insert(0, entry)
+    room.history = room.history[:8]
 
     await broadcast_state(room)
 
     # Let the client animation breathe:
-    # base 1.8s + 0.55s per card feels good
     wait_s = 1.8 + 0.55 * max(1, len(room.players))
     await asyncio.sleep(wait_s)
 
@@ -365,47 +388,57 @@ HOME_HTML = r"""
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Cardgame</title>
+    <title>La Surprise</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       :root {
-        --bg: #ffffff;
-        --text: #111;
-        --muted: #666;
-        --border: #e6e6e6;
-        --card: #ffffff;
-        --shadow: 0 10px 30px rgba(0,0,0,0.08);
+        --bg: #0b0b0f;
+        --panel: rgba(255,255,255,0.06);
+        --panel2: rgba(255,255,255,0.08);
+        --text: rgba(255,255,255,0.92);
+        --muted: rgba(255,255,255,0.62);
+        --border: rgba(255,255,255,0.12);
+        --shadow: 0 20px 60px rgba(0,0,0,0.55);
+        --shadow2: 0 8px 26px rgba(0,0,0,0.45);
         --radius: 18px;
+        --gold: rgba(218, 182, 122, 0.95);
+        --danger: rgba(193,18,31,0.95);
       }
 
       body {
         font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-        background: var(--bg);
         color: var(--text);
         max-width: 1100px;
         margin: 30px auto;
         padding: 0 16px;
+        background:
+          radial-gradient(circle at 20% 0%, rgba(218,182,122,0.12) 0%, rgba(0,0,0,0) 45%),
+          radial-gradient(circle at 80% 10%, rgba(255,255,255,0.06) 0%, rgba(0,0,0,0) 50%),
+          radial-gradient(circle at 50% 120%, rgba(255,255,255,0.05) 0%, rgba(0,0,0,0) 55%),
+          linear-gradient(180deg, #0b0b0f 0%, #07070a 100%);
       }
 
-      h1 { font-size: 42px; margin: 0 0 8px; }
-      .sub { color: var(--muted); margin: 0 0 22px; }
+      h1 {
+        font-size: 46px;
+        margin: 0 0 8px;
+        letter-spacing: 0.5px;
+      }
+      .sub { color: var(--muted); margin: 0 0 22px; max-width: 900px; }
 
       .grid {
         display: grid;
         grid-template-columns: 1fr;
         gap: 16px;
       }
-
-      @media (min-width: 900px) {
-        .grid { grid-template-columns: 1fr 1fr; }
-      }
+      @media (min-width: 900px) { .grid { grid-template-columns: 1fr 1fr; } }
 
       .box {
         border: 1px solid var(--border);
         border-radius: var(--radius);
         padding: 18px;
         box-shadow: var(--shadow);
-        background: #fff;
+        background: linear-gradient(180deg, var(--panel2), var(--panel));
+        backdrop-filter: blur(10px);
       }
 
       input, button, select {
@@ -413,19 +446,20 @@ HOME_HTML = r"""
         font-size: 16px;
         border-radius: 12px;
         border: 1px solid var(--border);
-        background: #fff;
+        background: rgba(255,255,255,0.06);
         color: var(--text);
+        outline: none;
       }
+
+      input::placeholder { color: rgba(255,255,255,0.45); }
 
       button {
         cursor: pointer;
-        border: 1px solid #111;
+        border: 1px solid rgba(255,255,255,0.35);
+        background: rgba(255,255,255,0.10);
       }
-
-      button:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
+      button:hover { border-color: rgba(255,255,255,0.55); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
 
       .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 
@@ -437,10 +471,10 @@ HOME_HTML = r"""
         border-radius: 999px;
         padding: 8px 12px;
         margin: 6px 6px 0 0;
-        background: #fafafa;
+        background: rgba(255,255,255,0.06);
       }
 
-      .code { font-weight: 800; letter-spacing: 1px; }
+      .code { font-weight: 900; letter-spacing: 1px; }
       .status { margin-top: 10px; color: var(--muted); min-height: 20px; }
 
       .split {
@@ -449,16 +483,15 @@ HOME_HTML = r"""
         gap: 16px;
         margin-top: 14px;
       }
-      @media (min-width: 900px) {
-        .split { grid-template-columns: 360px 1fr; }
-      }
+      @media (min-width: 900px) { .split { grid-template-columns: 360px 1fr; } }
 
       .section {
         border: 1px solid var(--border);
         border-radius: var(--radius);
         padding: 16px;
-        box-shadow: var(--shadow);
-        background: #fff;
+        box-shadow: var(--shadow2);
+        background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.05));
+        backdrop-filter: blur(10px);
       }
 
       .big {
@@ -477,49 +510,94 @@ HOME_HTML = r"""
         width: 74px;
         height: 104px;
         border-radius: 14px;
-        border: 1px solid var(--border);
-        background: var(--card);
-        box-shadow: 0 6px 16px rgba(0,0,0,0.06);
+        border: 1px solid rgba(0,0,0,0.30);
+        background: rgba(255,255,255,0.96);
+        box-shadow: 0 10px 24px rgba(0,0,0,0.28);
         display: flex;
         flex-direction: column;
         justify-content: space-between;
         padding: 10px;
         user-select: none;
-        transition: transform 0.08s ease, outline 0.08s ease;
+        transition: transform 0.10s ease, outline 0.10s ease, box-shadow 0.10s ease;
       }
 
       .card:hover { transform: translateY(-2px); }
-      .card.selected { outline: 3px solid #111; }
+      .card.selected { outline: 3px solid rgba(255,255,255,0.45); }
+
       .card.back {
-        background: linear-gradient(135deg, #111 0%, #333 100%);
-        border-color: #111;
+        background: linear-gradient(135deg, #101016 0%, #2a2a33 100%);
+        border-color: rgba(255,255,255,0.10);
+        box-shadow: 0 10px 24px rgba(0,0,0,0.55);
       }
 
       .corner { font-weight: 900; font-size: 18px; }
       .suit { font-size: 24px; align-self: flex-end; }
 
       .red { color: #c1121f; }
-      .black { color: #111; }
-
-      .winner {
-        margin-top: 10px;
-        font-weight: 900;
-      }
-
-      .explosion {
-        margin-top: 10px;
-        font-weight: 900;
-      }
+      .black { color: #0f0f14; }
 
       .muted { color: var(--muted); }
-
       .hide { display: none !important; }
+
+      /* Reveal drama */
+      @keyframes pulse {
+        0% { opacity: 0.35; }
+        50% { opacity: 1; }
+        100% { opacity: 0.35; }
+      }
+      .revealing {
+        animation: pulse 1.1s ease-in-out infinite;
+        font-weight: 900;
+        color: rgba(255,255,255,0.85);
+      }
+
+      .banner {
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.06);
+        font-weight: 900;
+      }
+      .banner.win { color: var(--gold); }
+      .banner.tie { color: var(--danger); }
+
+      .winGlow {
+        outline: 3px solid rgba(218,182,122,0.95);
+        box-shadow: 0 0 0 4px rgba(218,182,122,0.10), 0 16px 40px rgba(0,0,0,0.45);
+      }
+      .tieGlow {
+        outline: 3px solid rgba(193,18,31,0.95);
+        box-shadow: 0 0 0 4px rgba(193,18,31,0.10), 0 16px 40px rgba(0,0,0,0.45);
+      }
+
+      .history {
+        margin-top: 16px;
+        border-top: 1px dashed var(--border);
+        padding-top: 14px;
+      }
+      .historyItem {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 8px 10px;
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 12px;
+        background: rgba(0,0,0,0.18);
+        margin-top: 8px;
+        font-size: 14px;
+        color: rgba(255,255,255,0.80);
+      }
+      .historyRight {
+        color: rgba(255,255,255,0.60);
+        white-space: nowrap;
+      }
     </style>
   </head>
 
   <body>
     <h1>La Surprise</h1>
-    <p class="sub">Create a room, share the code, then everyone locks a card. Reveal happens together. Highest wins a point. Tie = explosion (no point).</p>
+    <p class="sub">A game of nerve and timing. Everyone locks one card. Highest wins a point. Tie = explosion.</p>
 
     <!-- LOBBY -->
     <div id="lobby">
@@ -576,6 +654,11 @@ HOME_HTML = r"""
           <div id="tablePlays" class="cards"></div>
           <div id="resultText"></div>
 
+          <div class="history">
+            <div class="big">Round history</div>
+            <div id="history"></div>
+          </div>
+
           <div style="margin-top:16px; border-top:1px dashed var(--border); padding-top:16px;">
             <div class="big">Your hand</div>
             <div class="status muted" id="handHint"></div>
@@ -592,10 +675,19 @@ HOME_HTML = r"""
 
       function byId(x){ return document.getElementById(x); }
 
-      function cardEl(card, clickable, selected) {
+      function phaseLabel(p){
+        if (p === "lobby") return "Lobby";
+        if (p === "lock_in") return "Lock in";
+        if (p === "reveal") return "Reveal";
+        if (p === "finished") return "Finished";
+        return p;
+      }
+
+      function cardEl(card, clickable, selected, extraClass) {
         const el = document.createElement("div");
         el.className = "card " + (card.color === "red" ? "red" : "black");
         if (selected) el.classList.add("selected");
+        if (extraClass) el.classList.add(extraClass);
 
         el.innerHTML = `
           <div class="corner">${card.label}</div>
@@ -640,7 +732,6 @@ HOME_HTML = r"""
         const el = byId("players");
         el.innerHTML = "";
 
-        // Sort by score desc
         const sorted = [...players].sort((a,b) => b.score - a.score);
 
         for (const p of sorted) {
@@ -650,6 +741,38 @@ HOME_HTML = r"""
           const status = p.locked ? "Locked" : "Choosing…";
           pill.textContent = `${icon} ${p.name} — ${p.score} pts — ${status}`;
           el.appendChild(pill);
+        }
+      }
+
+      function renderHistory(history, playersById){
+        const el = byId("history");
+        el.innerHTML = "";
+        if (!history || history.length === 0) {
+          el.innerHTML = `<div class="status muted">No rounds yet.</div>`;
+          return;
+        }
+
+        for (const h of history) {
+          const row = document.createElement("div");
+          row.className = "historyItem";
+
+          let left = `Round ${h.round}`;
+          let right = "";
+
+          if (h.explosion) {
+            left += ` — 💥 Explosion`;
+            right = `Top: ${h.topRank}`;
+          } else {
+            const winner = playersById[h.winnerId];
+            const wname = winner ? winner.name : "Winner";
+            const wc = h.winnerCard;
+            const cardTxt = wc ? `${wc.label}${wc.symbol}` : "";
+            left += ` — 🏆 ${wname}`;
+            right = cardTxt ? `Won with ${cardTxt}` : "";
+          }
+
+          row.innerHTML = `<div>${left}</div><div class="historyRight">${right}</div>`;
+          el.appendChild(row);
         }
       }
 
@@ -667,7 +790,6 @@ HOME_HTML = r"""
 
         if (phase === "lock_in") {
           hint.textContent = "Cards are face down. Reveal happens when everyone locks in.";
-          // show facedown placeholders (one per player)
           for (const pid in playersById) {
             const wrap = document.createElement("div");
             wrap.style.display = "flex";
@@ -677,7 +799,7 @@ HOME_HTML = r"""
 
             const name = document.createElement("div");
             name.style.fontSize = "12px";
-            name.style.color = "#666";
+            name.style.color = "rgba(255,255,255,0.62)";
             name.textContent = playersById[pid].name;
 
             wrap.appendChild(name);
@@ -692,12 +814,15 @@ HOME_HTML = r"""
           return;
         }
 
-        hint.textContent = "Revealing…";
+        hint.innerHTML = `<span class="revealing">Revealing…</span>`;
 
-        // Sequential reveal animation
         const order = lastReveal.order || [];
         const playMap = {};
         for (const x of (lastReveal.plays || [])) playMap[x.playerId] = x.card;
+
+        // Who should glow?
+        const topIds = lastReveal.topIds || [];
+        const winnerId = lastReveal.winnerId;
 
         let i = 0;
         function step(){
@@ -713,13 +838,19 @@ HOME_HTML = r"""
 
             const name = document.createElement("div");
             name.style.fontSize = "12px";
-            name.style.color = "#666";
+            name.style.color = "rgba(255,255,255,0.62)";
             name.textContent = player ? player.name : pid;
 
             wrap.appendChild(name);
 
             if (j <= i) {
-              wrap.appendChild(cardEl(playMap[pid], false, false));
+              let glow = "";
+              // Only apply glow after full reveal finishes (j == order.length-1 at the end)
+              if (i >= order.length - 1) {
+                if (lastReveal.explosion && topIds.includes(pid)) glow = "tieGlow";
+                if (!lastReveal.explosion && winnerId === pid) glow = "winGlow";
+              }
+              wrap.appendChild(cardEl(playMap[pid], false, false, glow));
             } else {
               wrap.appendChild(cardBackEl());
             }
@@ -729,14 +860,14 @@ HOME_HTML = r"""
 
           i++;
           if (i < order.length) {
-            setTimeout(step, 500);
+            setTimeout(step, 520);
           } else {
-            // show winner text at end
             if (lastReveal.explosion) {
-              rt.innerHTML = `<div class="explosion">💥 Explosion! Tie for highest card. No point awarded.</div>`;
+              rt.innerHTML = `<div class="banner tie">💥 Explosion — no point.</div>`;
             } else {
               const winner = playersById[lastReveal.winnerId];
-              rt.innerHTML = `<div class="winner">🏆 ${winner ? winner.name : "Winner"} takes the point.</div>`;
+              const name = winner ? winner.name : "Winner";
+              rt.innerHTML = `<div class="banner win">🏆 ${name} wins the round (+1).</div>`;
             }
           }
         }
@@ -768,10 +899,9 @@ HOME_HTML = r"""
         const canSelect = (phase === "lock_in" && !locked);
         for (const c of hand) {
           const selected = (selectedCardId === c.id);
-          el.appendChild(cardEl(c, canSelect, selected));
+          el.appendChild(cardEl(c, canSelect, selected, ""));
         }
 
-        // Add lock in button
         const btn = document.createElement("button");
         btn.textContent = locked ? "Locked" : "Lock in";
         btn.disabled = locked || !selectedCardId;
@@ -826,7 +956,6 @@ HOME_HTML = r"""
           }
 
           if (msg.type === "hello") {
-            // Switch UI to game screen
             byId("lobby").classList.add("hide");
             byId("game").classList.remove("hide");
             byId("roomcode").textContent = code;
@@ -837,7 +966,7 @@ HOME_HTML = r"""
           if (msg.type === "state") {
             lastState = msg;
 
-            byId("phase").textContent = msg.phase;
+            byId("phase").textContent = phaseLabel(msg.phase);
             byId("round").textContent = msg.round || "-";
             byId("roundsPlayed").textContent = msg.roundsPlayed || 0;
 
@@ -846,8 +975,8 @@ HOME_HTML = r"""
 
             renderPlayers(msg.players);
             renderLockStatus(msg.players, msg.phase);
+            renderHistory(msg.history, playersById);
 
-            // If your hand changed and you selected a card that no longer exists, clear selection.
             if (msg.you && msg.you.hand) {
               const exists = msg.you.hand.some(c => c.id === selectedCardId);
               if (!exists) selectedCardId = null;
@@ -863,7 +992,6 @@ HOME_HTML = r"""
         };
       }
 
-      // Convenience: if you share ?code=XXXXX
       const params = new URLSearchParams(location.search);
       if (params.get("code")) {
         byId("code").value = params.get("code").toUpperCase();
@@ -935,7 +1063,6 @@ async def ws_room(websocket: WebSocket, code: str):
                 room.socket_to_player[websocket] = player_id
                 await websocket.send_text(json.dumps({"type": "hello", "playerId": player_id}))
 
-                # Start game automatically once we have 2+ total players (bots count)
                 if room.phase == "lobby":
                     asyncio.create_task(start_game(room))
 
@@ -961,7 +1088,6 @@ async def ws_room(websocket: WebSocket, code: str):
                 if not card_id:
                     continue
 
-                # Card must be in your hand
                 idx = next((i for i, c in enumerate(you.hand) if c["id"] == card_id), None)
                 if idx is None:
                     continue
@@ -970,7 +1096,6 @@ async def ws_room(websocket: WebSocket, code: str):
                 room.pending_plays[you.id] = chosen
                 you.locked = True
 
-                # If bots haven't locked yet, speed them up a bit
                 for b in bot_players(room):
                     if not b.locked:
                         asyncio.create_task(bot_lock_after_delay(room, b, delay_s=random.uniform(0.15, 0.7)))
@@ -987,7 +1112,6 @@ async def ws_room(websocket: WebSocket, code: str):
 
         if player_id:
             room.players = [p for p in room.players if p.id != player_id]
-
             if len(room.players) < 2:
                 room.phase = "finished"
 
